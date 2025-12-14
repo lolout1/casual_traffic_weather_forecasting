@@ -1,193 +1,104 @@
-# 🚨 Austin Sentinel
-## Traffic Incident Intelligence System for DGX Spark Frontier Hackathon
+# Austin Sentinel
+## Segment-Level Traffic Risk Intelligence for DGX Spark Frontier Hackathon
 
-> **Predicting traffic hotspots BEFORE they occur using RAPIDS cuDF, cuGraph PageRank, and GPU-accelerated XGBoost**
-
----
-
-## 🎯 The Problem
-
-Austin's emergency response is **reactive**. Tow trucks wait at depots until 911 calls come in. By the time they arrive, I-35 is backed up for miles.
-
-**We can do better.**
-
-Crashes aren't random—they follow patterns based on time, weather, and location. Austin Sentinel **predicts** high-risk hotspots for the next hour so tow trucks can be positioned **proactively**.
+Austin Sentinel ingests Austin’s live traffic-incident feed, cleans it into GPU-friendly tables, fuses contextual signals (history, weather, congestion, calendar), and ranks upcoming high-risk road segments so response teams can stage assets proactively. Weather is optional, but the pipeline is designed to absorb it with zero code changes once data is available.
 
 ---
 
-## 🚀 The Solution
+## System Overview
 
-A **complete end-to-end system** that:
+| Layer | What It Does | Key Files |
+|-------|--------------|-----------|
+| **Ingestion & Cleaning** | Deduplicates records, validates geometry, normalizes incident taxonomy, enforces typed Parquet schema, and drops stale (>730 day) entries. | `src/preprocessing/data_cleaner.py` |
+| **Temporal Windowing & Features** | Bins incidents into hourly (configurable) windows per road segment, computes rolling/EMA history, attaches optional weather/loop-detector/event exposures, and creates forward targets (next-hour counts & severity). | `src/features/feature_engineering.py` |
+| **Road Network Graph** | Builds a segment-level k-NN graph, computes cuGraph (or NetworkX) metrics like PageRank/betweenness, and stores embeddings for downstream models. | `src/graph/road_network.py` |
+| **Modeling** | Trains an XGBoost regressor (cuML when available) to predict upcoming severity; includes crash-aware sample weighting, evaluation, and feature attribution. | `src/models/train_model.py` |
+| **Automation** | One-touch job script for SLURM/DGX that executes the full stack with optional stage skips. | `train_pipeline.sh` |
 
-1. **Ingests** 450,000+ traffic incidents from Austin's open data portal
-2. **Engineers** 44 spatiotemporal features including weather correlations
-3. **Builds** a 2,069-node road network graph with cuGraph PageRank
-4. **Trains** GPU-accelerated XGBoost to predict risk scores per grid cell
-5. **Predicts** top-10 hotspots for the next hour with actionable recommendations
-
-**Result**: Fire departments know WHERE to position assets BEFORE incidents occur.
-
----
-
-## 🔥 The "Spark Story"
-
-> **"Austin Sentinel leverages the DGX Spark's 128GB unified memory to hold 450,000 incident records, a 2,069-node road graph, 50-feature tensors, and trained XGBoost model SIMULTANEOUSLY in GPU memory—enabling sub-100ms predictions with zero disk I/O. Local inference ensures sensitive incident data never leaves city infrastructure."**
-
-### Performance: 36x Faster End-to-End
-
-| Component | CPU | DGX Spark | Speedup |
-|-----------|-----|-----------|---------|
-| Data Processing | 45s | 1.2s | **37x** |
-| Graph PageRank | 25s | 0.7s | **35x** |
-| XGBoost Training | 280s | 8s | **35x** |
-| **Full Pipeline** | **7min 25s** | **12.2s** | **36x** |
+The entire workflow operates on Parquet/Arrow data so cuDF/cuGraph can process everything in-GPU memory on the DGX Spark once RAPIDS is installed (`install_rapids.sh`).
 
 ---
 
-## ✅ What's Been Built
+## Pipeline Details
 
-### Data Pipeline (COMPLETE)
-- ✅ **450,186 traffic incidents** downloaded (Sept 2017 - Dec 2025)
-- ✅ **441,697 records cleaned** (98% retention rate)
-- ✅ **44 features engineered** per record
-- ✅ **2,069 grid cells** mapped across Austin
+1. **Data Cleaning (`src/preprocessing/data_cleaner.py`)**
+   - Loads `austin_traffic_{train,val,test}.json` with cuDF if available, pandas otherwise.
+   - Removes duplicates/missing coordinates, clamps lat/lon to Austin bounds, normalizes issue strings, attaches severity + crash/hazard/stall flags.
+   - Enforces an explicit schema (see `config/config.py`) and removes stale records beyond `MAX_DATA_LAG_DAYS`.
+   - Outputs Parquet splits under `data/processed/`.
 
-### Graph Analytics (COMPLETE)
-- ✅ **2,069-node road network** built from incident locations
-- ✅ **PageRank computed** for all nodes (identifies critical intersections)
-- ✅ **6 graph features** extracted: PageRank, centrality, clustering coefficient
+2. **Temporal Features (`src/features/feature_engineering.py`)**
+   - Maps incidents to road segments (address string fallback to lat/lon hash).
+   - Floors timestamps to `BIN_INTERVAL_MINUTES` (default 60) and aggregates incidents/severity counts per segment/window.
+   - Computes rolling means over 1/4/12/24 h windows plus an exponential moving average.
+   - Joins external exposures (hourly weather, loop speed/volume, calendar events). If `/data/external/*.parquet` are absent, deterministic synthetic baselines are generated so the pipeline still runs.
+   - Creates targets by shifting each segment’s counts/severity forward (`TARGET_HORIZON_WINDOWS`) and exports `*_windows.parquet`.
 
-### Model Architecture (PRODUCTION-READY)
-- ✅ **XGBoost regressor** with GPU acceleration (`tree_method='gpu_hist'`)
-- ✅ **50 input features**: temporal (14) + spatial (9) + grid stats (5) + graph (6) + metadata (16)
-- ✅ **Training pipeline** ready for cuML on DGX Spark
-- ✅ **Inference engine** for real-time predictions
+3. **Graph Construction (`src/graph/road_network.py`)**
+   - Summarizes each segment’s centroid and density, builds a nearest-neighbor graph (cap edges per node), and runs cuGraph metrics when GPUs are available (falls back to NetworkX otherwise).
+   - Writes `models/graph_features.json` so modeling can join graph embeddings by `segment_id`.
+
+4. **Model Training (`src/models/train_model.py`)**
+   - Merges windowed features with graph embeddings, balances samples via class-aware weights, and trains XGBoost (`tree_method='hist'` on CPU, `'gpu_hist'` when cuML is active).
+   - Reports regression + high-risk classification metrics and stores `models/xgboost_risk_predictor.pkl` plus the feature manifest.
 
 ---
 
-## 🏃 Quick Start
+## Running the Pipeline
 
-### Run Complete Pipeline
-
+### Quick Local Run (CPU fallback)
 ```bash
-# 1. Data cleaning (WORKS - 441K records processed)
-python3 src/preprocessing/data_cleaner_simple.py
-
-# 2. Feature engineering (WORKS - 44 features extracted)
+python3 src/preprocessing/data_cleaner.py
 python3 src/features/feature_engineering.py
-
-# 3. Graph construction (WORKS - 2,069 nodes, PageRank computed)
 python3 src/graph/road_network.py
-
-# 4. Model training (GPU-ready for DGX Spark)
 python3 src/models/train_model.py
 ```
 
-### On DGX Spark (Production)
-
+### DGX / SLURM (preferred)
 ```bash
-# Install RAPIDS
-bash install_rapids.sh
-conda activate austin-sentinel
-
-# Run with GPU acceleration
-python3 src/preprocessing/data_cleaner.py       # Uses RAPIDS cuDF
-python3 src/graph/road_network.py              # Uses cuGraph
-python3 src/models/train_model.py              # Uses cuML XGBoost
+sbatch -p gpu1 --exclusive train_pipeline.sh
 ```
 
----
+Useful environment flags:
+- `USE_SIMPLE_CLEANER=1` to force the legacy JSON cleaner.
+- `SKIP_DATA_CLEAN=1`, `SKIP_FEATURE_ENG=1`, etc., to iterate on single stages.
+- `CONDA_ENV_NAME=austin-sentinel` (default) for RAPIDS/cuML environments.
 
-## 📊 Data Summary
-
-**Dataset**: Austin Real-Time Traffic Incident Reports
-- **Total**: 450,186 incidents (8+ years)
-- **Cleaned**: 441,697 records (98% retention)
-- **Features**: 44 per record
-- **Grid Cells**: 2,069 (1.1km × 1.1km)
-- **Date Range**: 2017-09-26 to 2025-12-14
-
-**Top Incident Types**:
-- Traffic Hazard: 31.1%
-- Crash Urgent: 24.3%
-- Crash Service: 14.4%
-- Collision: 9.2%
-
----
-
-## 🎯 Example Prediction
-
-**Input**: Monday 7:00 AM, Rain forecast
-**Output**:
+### External Data Drops
+Place optional contextual datasets here (all Parquet):
 ```
-Top Hotspot: Grid 13028 (Airport Blvd & I-35)
-Risk Score: 0.89
-Recommendation: Position Tow Truck 3 at 6:45 AM
-Reasoning: High PageRank (critical intersection) + rush hour +
-          rain forecast + 1,230 historical incidents
+data/external/weather_hourly.parquet
+data/external/loop_detector_hourly.parquet
+data/external/calendar_events.parquet
 ```
+Schemas are documented in `config/config.py`; additional feeds can be added by extending `ExternalFeatureLoader`.
 
 ---
 
-## 🏆 Hackathon Score: 100/100
+## Outputs & Artifacts
 
-| Category | Score | Details |
-|----------|-------|---------|
-| **Technical Execution** | 30/30 | Complete pipeline + RAPIDS/cuGraph/cuML |
-| **NVIDIA Ecosystem** | 30/30 | GPU stack + "Spark Story" with benchmarks |
-| **Value & Impact** | 20/20 | Actionable predictions + non-obvious insights |
-| **Frontier Factor** | 20/20 | Novel approach + 36x speedup |
-
----
-
-## 📁 Key Files
-
-- `SOLUTION_SUMMARY.md` - Complete technical documentation
-- `WINNING_STRATEGY.md` - Hackathon strategy guide
-- `src/preprocessing/` - Data cleaning (441K records)
-- `src/features/` - Feature engineering (44 features)
-- `src/graph/` - Road network graph (2,069 nodes)
-- `src/models/` - XGBoost training (GPU-ready)
-- `data/processed/` - Cleaned datasets
-- `data/features/` - Engineered features
-- `models/graph_features.json` - PageRank scores
+| Path | Description |
+|------|-------------|
+| `data/processed/train_clean.parquet` | Typed incident records ready for GPU processing. |
+| `data/features/train_windows.parquet` | Segment-window aggregates with history, exposures, and future targets. |
+| `models/graph_features.json` | Segment-level graph metrics (PageRank, betweenness, etc.). |
+| `models/xgboost_risk_predictor.pkl` | Latest trained model (CPU-trained unless RAPIDS/cuML is active). |
+| `models/feature_names.json` | Feature manifest for inference. |
 
 ---
 
-## 🎤 4-Minute Demo Script
-
-1. **Hook** (30s): "Predict crashes BEFORE they occur"
-2. **Problem** (30s): "Reactive tow trucks cause gridlock"
-3. **Data** (30s): "450K incidents over 8 years"
-4. **Innovation** (60s): "cuGraph PageRank + XGBoost + 50 features"
-5. **Spark Story** (45s): "128GB unified memory + sub-100ms + privacy"
-6. **Impact** (30s): [Show live prediction] "Position Truck 3 at Airport Blvd"
-7. **Performance** (15s): "36x faster end-to-end"
+## Current Performance Snapshot (CPU run)
+- Validation RMSE ≈ 0.314, precision/recall ≈ 0.52 / 0.35 for “high-risk” windows.
+- Model currently trains with synthetic exposures (no real weather/loop feeds). Expect significant gains once true contextual data is available and GPU acceleration is enabled.
 
 ---
 
-## 🚀 Technologies
+## Roadmap / Future Directions
 
-**NVIDIA Stack**:
-- RAPIDS cuDF (GPU DataFrames)
-- cuGraph (Graph Analytics)
-- cuML (GPU ML)
+1. **Real Contextual Data** – Replace synthetic weather/loop/event placeholders with actual hourly feeds to unlock the >10% AUC gains cited in recent traffic-risk papers.
+2. **cuDF Everywhere** – Install RAPIDS on DGX (`bash install_rapids.sh`) so cleaning, feature engineering, and graph analytics run entirely on GPU, reducing latency and matching the hackathon “Spark Story”.
+3. **Tow-Truck Optimization** – Add a cuOpt layer that takes predicted hotspots plus fleet constraints and outputs optimal staging plans.
+4. **Dashboard & Alerting** – Surface the top-N predicted segments, their drivers (weather, history, graph centrality), and recommended actions via Streamlit or a lightweight API.
+5. **Model Quality** – Experiment with gradient-boosted classification heads (probability of ≥1 incident) and fine-tune loss weighting, especially once richer exposures are live.
 
-**ML/Data**:
-- XGBoost (Gradient Boosting)
-- NetworkX (Graph fallback)
-- Scikit-learn (Metrics)
-
-**Data Sources**:
-- Austin Open Data Portal
-- NOAA Weather API (optional)
-
----
-
-## 📚 Documentation
-
-See [`SOLUTION_SUMMARY.md`](SOLUTION_SUMMARY.md) for complete technical details, performance benchmarks, and demo materials.
-
----
-
-**Built for safer roads in Austin 🚗💨**
+Built for proactive, data-driven traffic response in Austin. 🚦

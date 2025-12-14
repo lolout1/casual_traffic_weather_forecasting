@@ -3,9 +3,10 @@ Data cleaning and preprocessing using RAPIDS cuDF (with pandas fallback)
 Handles raw traffic incident data and prepares it for feature engineering
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 import sys
 import os
+from typing import Dict, Any
 
 # Add parent directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
@@ -27,6 +28,55 @@ class DataCleaner:
         """Print log message if verbose"""
         if self.verbose:
             print(f"[DataCleaner] {message}")
+
+    def enforce_schema(self, df):
+        """Ensure dataframe matches expected schema with explicit dtypes."""
+        missing_cols = [col for col in DATA_SCHEMA.keys() if col not in df.columns]
+        for col in missing_cols:
+            df[col] = None
+
+        for col, dtype in DATA_SCHEMA.items():
+            if dtype.startswith("datetime64") and col in df.columns:
+                try:
+                    df[col] = df[col].dt.tz_localize(None)
+                except (AttributeError, TypeError, ValueError):
+                    # Column may already be naive or not datetime
+                    pass
+
+        try:
+            df = df.astype(DATA_SCHEMA)
+        except Exception as exc:
+            self.log(f"✗ Failed to coerce schema: {exc}")
+            raise
+
+        extra_cols = [c for c in df.columns if c not in DATA_SCHEMA]
+        if extra_cols:
+            self.log(f"⚠️  Extra columns retained in cleaned set: {extra_cols}")
+
+        return df
+
+    def validate_temporal_quality(self, df):
+        """Reject stale or non-monotonic timestamps."""
+        df = df.sort_values('published_date')
+
+        diffs = df['published_date'].diff()
+        backward_steps = int((diffs < timedelta(0)).sum())
+        if backward_steps > 0:
+            self.log(f"⚠️  Detected {backward_steps} non-monotonic timestamp jumps; resorting.")
+            df = df.sort_values('published_date')
+
+        latest_ts = df['published_date'].max()
+        earliest_ts = df['published_date'].min()
+        self.log(f"   Data coverage: {earliest_ts} → {latest_ts}")
+
+        if latest_ts is not None:
+            cutoff = latest_ts - timedelta(days=MAX_DATA_LAG_DAYS)
+            stale_count = int((df['published_date'] < cutoff).sum())
+            if stale_count > 0:
+                self.log(f"   Removing {stale_count:,} stale records older than {MAX_DATA_LAG_DAYS} days")
+                df = df[df['published_date'] >= cutoff]
+
+        return df
 
     def load_data(self, file_path):
         """
@@ -114,10 +164,11 @@ class DataCleaner:
 
         # Add status timestamp if available
         if 'traffic_report_status_date_time' in df.columns:
-            df['status_date'] = to_datetime(
+            df['traffic_report_status_date_time'] = to_datetime(
                 df['traffic_report_status_date_time'],
                 errors='coerce'
             )
+            df['status_date'] = df['traffic_report_status_date_time']
 
         self.stats['invalid_timestamps_removed'] = invalid_timestamps
 
@@ -182,8 +233,11 @@ class DataCleaner:
         self.log(f"Retention rate:     {retention_rate:.2f}%")
         self.log("="*60)
 
-        self.stats['final_records'] = final_count
-        self.stats['retention_rate'] = retention_rate
+        df = self.validate_temporal_quality(df)
+        df = self.enforce_schema(df)
+
+        self.stats['final_records'] = len(df)
+        self.stats['retention_rate'] = (len(df) / initial_count) * 100 if initial_count else 0
 
         return df
 
@@ -198,8 +252,10 @@ class DataCleaner:
         """
         self.log(f"\nSaving processed data to {output_path}...")
 
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
         if format == 'parquet':
-            df.to_parquet(output_path)
+            df.to_parquet(output_path, index=False)
         elif format == 'csv':
             df.to_csv(output_path, index=False)
         else:
@@ -222,6 +278,8 @@ def main():
     print("🚀 " * 20 + "\n")
 
     cleaner = DataCleaner(verbose=True)
+
+    print_performance_info()
 
     # Process training data
     print("\n" + "="*60)

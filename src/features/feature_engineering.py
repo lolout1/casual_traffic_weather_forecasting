@@ -1,389 +1,276 @@
 """
-Feature engineering for traffic incident prediction
-Extracts temporal, spatial, and historical features
+GPU-aware feature engineering that builds temporal windows, joins external
+exposures, and materializes forward-looking targets for crash risk modeling.
 """
 
-import json
+import math
 import os
 import sys
-from datetime import datetime
-from collections import defaultdict
-import math
+from typing import Dict, List
+
+import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
-from config.config import *
+from config.config import (
+    PROCESSED_DATA_DIR,
+    FEATURES_DATA_DIR,
+    MODEL_DIR,
+    BIN_INTERVAL_MINUTES,
+    TARGET_HORIZON_WINDOWS,
+    ROLLING_WINDOWS,
+    EMA_ALPHA,
+    WEATHER_FEATURES,
+    LOOP_FEATURES,
+    EVENT_FEATURES,
+    AUSTIN_CENTER_LAT,
+    AUSTIN_CENTER_LON,
+    WEATHER_PARQUET,
+    LOOP_VOLUME_PARQUET,
+    EVENTS_PARQUET,
+    RISK_THRESHOLD,
+)
+from src.utils.gpu_utils import (
+    GPU_AVAILABLE,
+    DataFrame,
+    read_parquet,
+    to_pandas,
+    from_pandas,
+)
+
+try:
+    import pandas as pd
+except ImportError:  # pragma: no cover - pandas should exist but guard anyway
+    pd = None
 
 
-class FeatureEngineer:
-    """Extract features from cleaned traffic incident data"""
+BIN_FREQ = f"{BIN_INTERVAL_MINUTES}min"
 
-    def __init__(self, verbose=True):
-        self.verbose = verbose
-        self.grid_stats = None  # Will store historical grid statistics
+
+def normalize_address(value):
+    if value is None:
+        return "UNKNOWN"
+    return str(value).strip().upper() or "UNKNOWN"
+
+
+def haversine_vector(lat1, lon1, lat2, lon2):
+    """Vectorized haversine distance in kilometers."""
+    lat1_rad = np.deg2rad(lat1)
+    lat2_rad = np.deg2rad(lat2)
+    dlat = lat2_rad - lat1_rad
+    dlon = np.deg2rad(lon2 - lon1)
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1_rad) * np.cos(lat2_rad) * np.sin(dlon / 2.0) ** 2
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+    return 6371.0 * c
+
+
+class ExternalFeatureLoader:
+    """Loads or synthesizes weather, loop-detector, and calendar features."""
+
+    def __init__(self, logger):
+        self.log = logger
+        self.weather = self._read_optional_parquet(WEATHER_PARQUET, "weather")
+        self.loop = self._read_optional_parquet(LOOP_VOLUME_PARQUET, "loop detector")
+        self.events = self._read_optional_parquet(EVENTS_PARQUET, "calendar/events")
+
+    def _read_optional_parquet(self, path, label):
+        if path.exists():
+            self.log(f"Loading {label} features from {path}")
+            df = read_parquet(path)
+            return to_pandas(df) if GPU_AVAILABLE else df
+        self.log(f"⚠️  No {label} file at {path} - generating synthetic baseline")
+        return None
+
+    def _generate_weather(self, windows: pd.Series) -> pd.DataFrame:
+        unique_windows = pd.DataFrame({'window_start': pd.Series(windows.unique()).sort_values()})
+        hours = unique_windows['window_start'].dt.hour
+        months = unique_windows['window_start'].dt.month
+        unique_windows['temperature_c'] = 18 + 10 * np.sin((months / 12) * 2 * np.pi)
+        unique_windows['humidity_pct'] = 60 + 20 * np.cos((hours / 24) * 2 * np.pi)
+        unique_windows['wind_speed_kmh'] = 15 + 5 * np.sin((hours / 24) * 2 * np.pi + np.pi / 4)
+        unique_windows['pressure_pa'] = 101325 + 500 * np.cos((months / 12) * 2 * np.pi)
+        unique_windows['visibility_m'] = 8000 - 2000 * (unique_windows['humidity_pct'] / 100)
+        unique_windows['precipitation_mm'] = np.clip(5 * np.random.RandomState(42).rand(len(unique_windows)), 0, 8)
+        unique_windows['is_raining'] = (unique_windows['precipitation_mm'] > 1.0).astype(int)
+        unique_windows['is_clear'] = (unique_windows['precipitation_mm'] < 0.5).astype(int)
+        return unique_windows
+
+    def _generate_loop(self, frame: pd.DataFrame) -> pd.DataFrame:
+        key = frame[['segment_id', 'window_start']].drop_duplicates().reset_index(drop=True)
+        hashed = pd.util.hash_pandas_object(key['segment_id'], index=False).astype(np.int64)
+        hour = key['window_start'].dt.hour
+        key['avg_speed_kmh'] = 45 + (hashed % 15) - 5 + 3 * np.sin((hour / 24) * 2 * np.pi)
+        key['vehicle_count'] = 50 + (hashed % 40) + 10 * np.cos((hour / 24) * 2 * np.pi)
+        key['congestion_index'] = np.clip(1 - key['avg_speed_kmh'] / 70, 0, 1)
+        return key
+
+    def _generate_events(self, windows: pd.Series) -> pd.DataFrame:
+        df = pd.DataFrame({'window_start': pd.Series(windows.unique()).sort_values()})
+        df['is_weekend'] = df['window_start'].dt.weekday >= 5
+        df['is_holiday'] = df['window_start'].dt.month.isin([1, 7, 12]).astype(int)
+        df['is_school_day'] = ((df['window_start'].dt.weekday < 5) & (~df['window_start'].dt.month.isin([6, 7, 8]))).astype(int)
+        df['is_special_event'] = (((df['window_start'].dt.day % 5) == 0) & (df['window_start'].dt.hour >= 18)).astype(int)
+        return df
+
+    def join_all(self, df: pd.DataFrame) -> pd.DataFrame:
+        windows = df['window_start']
+        weather = self.weather if self.weather is not None else self._generate_weather(windows)
+        loop = self.loop if self.loop is not None else self._generate_loop(df)
+        events = self.events if self.events is not None else self._generate_events(windows)
+
+        df = df.merge(weather, on='window_start', how='left')
+        df = df.merge(loop, on=['segment_id', 'window_start'], how='left')
+        df = df.merge(events, on='window_start', how='left')
+
+        for feature in WEATHER_FEATURES + LOOP_FEATURES + EVENT_FEATURES:
+            if feature not in df.columns:
+                df[feature] = 0.0
+
+        return df
+
+
+class TemporalFeatureEngineer:
+    """Builds temporal windows with forward-looking targets."""
+
+    def __init__(self, bin_minutes=BIN_INTERVAL_MINUTES):
+        self.bin_minutes = bin_minutes
+        self.external_loader = ExternalFeatureLoader(self.log)
 
     def log(self, message):
-        if self.verbose:
-            print(f"[FeatureEngineer] {message}")
+        print(f"[FeatureEngineer] {message}")
 
-    def load_data(self, file_path):
-        """Load cleaned JSON data"""
-        self.log(f"Loading data from {file_path}...")
+    def load_clean_split(self, split: str):
+        path = PROCESSED_DATA_DIR / f"{split}_clean.parquet"
+        if not path.exists():
+            raise FileNotFoundError(f"Missing cleaned parquet for split '{split}' at {path}")
+        self.log(f"Loading cleaned {split} data from {path}")
+        return read_parquet(path)
 
-        with open(file_path, 'r') as f:
-            data = json.load(f)
+    def _assign_segments(self, df):
+        if GPU_AVAILABLE:
+            df['segment_id'] = df['address'].fillna('UNKNOWN').astype('str').str.strip().str.upper()
+        else:
+            df['segment_id'] = df['address'].fillna('UNKNOWN').astype(str).str.strip().str.upper()
 
-        self.log(f"✓ Loaded {len(data):,} records")
-        return data
-
-    def haversine_distance(self, lat1, lon1, lat2, lon2):
-        """
-        Calculate distance between two points using Haversine formula
-
-        Returns distance in kilometers
-        """
-        R = 6371  # Earth's radius in km
-
-        lat1_rad = math.radians(lat1)
-        lat2_rad = math.radians(lat2)
-        dlat = math.radians(lat2 - lat1)
-        dlon = math.radians(lon2 - lon1)
-
-        a = (math.sin(dlat / 2) ** 2 +
-             math.cos(lat1_rad) * math.cos(lat2_rad) *
-             math.sin(dlon / 2) ** 2)
-        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-        return R * c
-
-    def extract_temporal_features(self, record):
-        """Extract time-based features"""
-
-        try:
-            dt = datetime.fromisoformat(record['published_date'].replace('Z', '+00:00'))
-        except:
-            # Fallback for different date formats
-            try:
-                dt = datetime.strptime(record['published_date'], '%Y-%m-%dT%H:%M:%S.%fZ')
-            except:
-                dt = datetime.now()  # Last resort
-
-        features = {
-            'hour': dt.hour,
-            'day_of_week': dt.weekday(),  # 0 = Monday
-            'month': dt.month,
-            'day_of_month': dt.day,
-            'week_of_year': dt.isocalendar()[1],
-            'year': dt.year,
-
-            # Binary flags
-            'is_weekend': int(dt.weekday() >= 5),
-            'is_rush_hour': int((7 <= dt.hour <= 9) or (16 <= dt.hour <= 19)),
-            'is_night': int((22 <= dt.hour) or (dt.hour <= 5)),
-            'is_morning': int(6 <= dt.hour <= 11),
-            'is_afternoon': int(12 <= dt.hour <= 17),
-            'is_evening': int(18 <= dt.hour <= 21),
-
-            # Season (meteorological)
-            'season': (dt.month % 12 + 3) // 3,  # 1=winter, 2=spring, 3=summer, 4=fall
-
-            # Cyclic encoding for hour (helps ML models understand circular nature)
-            'hour_sin': math.sin(2 * math.pi * dt.hour / 24),
-            'hour_cos': math.cos(2 * math.pi * dt.hour / 24),
-
-            # Cyclic encoding for day of week
-            'dow_sin': math.sin(2 * math.pi * dt.weekday() / 7),
-            'dow_cos': math.cos(2 * math.pi * dt.weekday() / 7),
-
-            # Timestamp for sorting/filtering
-            'timestamp': dt.timestamp(),
-        }
-
-        return features
-
-    def extract_spatial_features(self, record):
-        """Extract location-based features"""
-
-        lat = record['latitude']
-        lon = record['longitude']
-
-        # Grid cell assignment
-        grid_lat = int((lat - AUSTIN_LAT_MIN) / GRID_SIZE_LAT)
-        grid_lon = int((lon - AUSTIN_LON_MIN) / GRID_SIZE_LON)
-        grid_cell = grid_lat * 1000 + grid_lon
-
-        # Distance from Austin center (downtown)
-        dist_from_center = self.haversine_distance(
-            lat, lon,
-            AUSTIN_CENTER_LAT, AUSTIN_CENTER_LON
-        )
-
-        # Quadrant (relative to center)
-        north_of_center = int(lat > AUSTIN_CENTER_LAT)
-        east_of_center = int(lon > AUSTIN_CENTER_LON)
-
-        features = {
-            'latitude': lat,
-            'longitude': lon,
-            'grid_lat': grid_lat,
-            'grid_lon': grid_lon,
-            'grid_cell': grid_cell,
-            'distance_from_center': dist_from_center,
-            'north_of_center': north_of_center,
-            'east_of_center': east_of_center,
-
-            # Quadrant encoding
-            'quadrant': north_of_center * 2 + east_of_center,  # 0=SW, 1=SE, 2=NW, 3=NE
-        }
-
-        return features
-
-    def compute_grid_statistics(self, data):
-        """
-        Compute historical statistics for each grid cell
-
-        This creates features like:
-        - Average incidents per grid cell
-        - Grid cell risk score
-        - Most common incident type per cell
-        """
-        self.log("\nComputing grid statistics from training data...")
-
-        grid_incidents = defaultdict(list)
-        grid_severity = defaultdict(list)
-
-        for record in data:
-            # Get grid cell
-            lat = record['latitude']
-            lon = record['longitude']
-            grid_lat = int((lat - AUSTIN_LAT_MIN) / GRID_SIZE_LAT)
-            grid_lon = int((lon - AUSTIN_LON_MIN) / GRID_SIZE_LON)
-            grid_cell = grid_lat * 1000 + grid_lon
-
-            grid_incidents[grid_cell].append(record)
-            grid_severity[grid_cell].append(record.get('severity', 0.5))
-
-        # Compute statistics
-        grid_stats = {}
-        for grid_cell, incidents in grid_incidents.items():
-            grid_stats[grid_cell] = {
-                'incident_count': len(incidents),
-                'avg_severity': sum(grid_severity[grid_cell]) / len(grid_severity[grid_cell]),
-                'crash_ratio': sum(1 for i in incidents if i.get('is_crash', 0)) / len(incidents),
-                'hazard_ratio': sum(1 for i in incidents if i.get('is_hazard', 0)) / len(incidents),
-            }
-
-        # Normalize incident count to risk score (0-1)
-        max_incidents = max(stats['incident_count'] for stats in grid_stats.values())
-        for grid_cell in grid_stats:
-            grid_stats[grid_cell]['risk_score'] = (
-                grid_stats[grid_cell]['incident_count'] / max_incidents
+        mask = (df['segment_id'] == "UNKNOWN")
+        if mask.any():
+            replacement = (
+                df.loc[mask, 'latitude'].round(3).astype(str) + "_" +
+                df.loc[mask, 'longitude'].round(3).astype(str)
             )
+            df.loc[mask, 'segment_id'] = replacement
 
-        self.grid_stats = grid_stats
-        self.log(f"✓ Computed statistics for {len(grid_stats):,} grid cells")
+        return df
 
-        return grid_stats
+    def _aggregate_windows(self, df):
+        df['window_start'] = df['published_date'].dt.floor(BIN_FREQ)
+        group_cols = ['segment_id', 'window_start']
+        agg_df = df.groupby(group_cols).agg({
+            'traffic_report_id': 'count',
+            'severity': ['sum', 'mean'],
+            'is_crash': 'sum',
+            'is_hazard': 'sum',
+            'is_stall': 'sum',
+            'latitude': 'mean',
+            'longitude': 'mean'
+        }).reset_index()
 
-    def extract_grid_features(self, record):
-        """Extract historical grid-based features"""
+        pdf = to_pandas(agg_df) if GPU_AVAILABLE else agg_df
+        pdf.columns = [
+            '_'.join(col).rstrip('_') if isinstance(col, tuple) else col
+            for col in pdf.columns
+        ]
 
-        if self.grid_stats is None:
-            return {
-                'grid_incident_count': 0,
-                'grid_avg_severity': 0.5,
-                'grid_risk_score': 0.0,
-                'grid_crash_ratio': 0.0,
-                'grid_hazard_ratio': 0.0,
-            }
-
-        # Get grid cell
-        lat = record['latitude']
-        lon = record['longitude']
-        grid_lat = int((lat - AUSTIN_LAT_MIN) / GRID_SIZE_LAT)
-        grid_lon = int((lon - AUSTIN_LON_MIN) / GRID_SIZE_LON)
-        grid_cell = grid_lat * 1000 + grid_lon
-
-        # Get grid statistics
-        stats = self.grid_stats.get(grid_cell, {
-            'incident_count': 0,
-            'avg_severity': 0.5,
-            'risk_score': 0.0,
-            'crash_ratio': 0.0,
-            'hazard_ratio': 0.0,
+        pdf = pdf.rename(columns={
+            'traffic_report_id_count': 'incident_count',
+            'severity_sum': 'severity_sum',
+            'severity_mean': 'severity_mean',
+            'is_crash_sum': 'crash_count',
+            'is_hazard_sum': 'hazard_count',
+            'is_stall_sum': 'stall_count',
+            'latitude_mean': 'segment_lat',
+            'longitude_mean': 'segment_lon'
         })
 
-        return {
-            'grid_incident_count': stats['incident_count'],
-            'grid_avg_severity': stats['avg_severity'],
-            'grid_risk_score': stats['risk_score'],
-            'grid_crash_ratio': stats['crash_ratio'],
-            'grid_hazard_ratio': stats['hazard_ratio'],
-        }
+        return pdf
 
-    def engineer_features(self, data, compute_grid_stats=False):
-        """
-        Apply feature engineering to all records
+    def _add_distance_feature(self, pdf: pd.DataFrame) -> pd.DataFrame:
+        distances = haversine_vector(
+            pdf['segment_lat'].values,
+            pdf['segment_lon'].values,
+            np.full(len(pdf), AUSTIN_CENTER_LAT),
+            np.full(len(pdf), AUSTIN_CENTER_LON)
+        )
+        pdf['segment_distance_from_center'] = distances
+        return pdf
 
-        Args:
-            data: List of cleaned incident records
-            compute_grid_stats: Whether to compute grid statistics (only for training data)
-        """
-        self.log("\n" + "="*60)
-        self.log("FEATURE ENGINEERING")
-        self.log("="*60)
+    def _add_rolling_features(self, pdf: pd.DataFrame) -> pd.DataFrame:
+        pdf = pdf.sort_values(['segment_id', 'window_start'])
 
-        # Compute grid statistics if requested (training data only)
-        if compute_grid_stats:
-            self.compute_grid_statistics(data)
+        for window in ROLLING_WINDOWS:
+            roll = (
+                pdf.groupby('segment_id')['incident_count']
+                .rolling(window=window, min_periods=1)
+                .mean()
+                .reset_index(level=0, drop=True)
+            )
+            pdf[f'rolling_incident_mean_{window}h'] = roll
 
-        self.log(f"\nEngineering features for {len(data):,} records...")
+            sev_roll = (
+                pdf.groupby('segment_id')['severity_sum']
+                .rolling(window=window, min_periods=1)
+                .sum()
+                .reset_index(level=0, drop=True)
+            )
+            pdf[f'rolling_severity_sum_{window}h'] = sev_roll
 
-        enhanced_data = []
-        for i, record in enumerate(data):
-            if i % 50000 == 0 and i > 0:
-                self.log(f"  Processed {i:,} records...")
+        ema = (
+            pdf.groupby('segment_id')['incident_count']
+            .apply(lambda s: s.ewm(alpha=EMA_ALPHA).mean())
+        )
+        pdf['ema_incident_count'] = ema.reset_index(level=0, drop=True)
 
-            # Create enhanced record with all original fields
-            enhanced_record = record.copy()
+        return pdf
 
-            # Add temporal features
-            temporal_features = self.extract_temporal_features(record)
-            enhanced_record.update(temporal_features)
+    def _add_targets(self, pdf: pd.DataFrame) -> pd.DataFrame:
+        pdf = pdf.sort_values(['segment_id', 'window_start'])
+        group = pdf.groupby('segment_id')
+        pdf['target_incident_count_next'] = group['incident_count'].shift(-TARGET_HORIZON_WINDOWS)
+        pdf['target_severity_next'] = group['severity_sum'].shift(-TARGET_HORIZON_WINDOWS)
+        pdf['target_has_incident_next'] = (pdf['target_incident_count_next'] > 0).astype(float)
+        pdf['target_high_risk_next'] = (pdf['target_severity_next'] >= RISK_THRESHOLD).astype(float)
+        pdf = pdf.dropna(subset=['target_incident_count_next', 'target_severity_next'])
+        return pdf
 
-            # Add spatial features
-            spatial_features = self.extract_spatial_features(record)
-            enhanced_record.update(spatial_features)
+    def build_split(self, split: str, compute_targets: bool = True):
+        df = self.load_clean_split(split)
+        df = self._assign_segments(df)
+        pdf = self._aggregate_windows(df)
+        pdf = self._add_distance_feature(pdf)
+        pdf = self.external_loader.join_all(pdf)
+        pdf = self._add_rolling_features(pdf)
+        if compute_targets:
+            pdf = self._add_targets(pdf)
 
-            # Add grid-based features
-            grid_features = self.extract_grid_features(record)
-            enhanced_record.update(grid_features)
+        output_path = FEATURES_DATA_DIR / f"{split}_windows.parquet"
+        FEATURES_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        pdf.to_parquet(output_path, index=False)
+        self.log(f"✓ Saved {len(pdf):,} windowed rows to {output_path}")
 
-            enhanced_data.append(enhanced_record)
-
-        self.log(f"✓ Feature engineering complete!")
-        self.log(f"  Original fields: {len(record.keys())}")
-        self.log(f"  Enhanced fields: {len(enhanced_record.keys())}")
-        self.log(f"  New features: {len(enhanced_record.keys()) - len(record.keys())}")
-
-        return enhanced_data
-
-    def save_features(self, data, output_path):
-        """Save engineered features to JSON"""
-        self.log(f"\nSaving features to {output_path}...")
-
-        with open(output_path, 'w') as f:
-            json.dump(data, f)
-
-        file_size = os.path.getsize(output_path) / 1024 / 1024
-        self.log(f"✓ Saved {len(data):,} records ({file_size:.1f} MB)")
-
-    def save_grid_stats(self, output_path):
-        """Save grid statistics for use in validation/test"""
-        if self.grid_stats is None:
-            self.log("⚠️  No grid statistics to save")
-            return
-
-        self.log(f"\nSaving grid statistics to {output_path}...")
-
-        with open(output_path, 'w') as f:
-            json.dump(self.grid_stats, f)
-
-        file_size = os.path.getsize(output_path) / 1024 / 1024
-        self.log(f"✓ Saved statistics for {len(self.grid_stats):,} grid cells ({file_size:.2f} MB)")
-
-    def load_grid_stats(self, file_path):
-        """Load pre-computed grid statistics"""
-        self.log(f"Loading grid statistics from {file_path}...")
-
-        with open(file_path, 'r') as f:
-            # Convert string keys back to int
-            grid_stats_str = json.load(f)
-            self.grid_stats = {int(k): v for k, v in grid_stats_str.items()}
-
-        self.log(f"✓ Loaded statistics for {len(self.grid_stats):,} grid cells")
+        if split == "train":
+            stats_path = FEATURES_DATA_DIR / "segment_stats.json"
+            stats = (
+                pdf.groupby('segment_id')[['segment_lat', 'segment_lon', 'segment_distance_from_center']]
+                .mean()
+                .reset_index()
+            )
+            stats.to_json(stats_path, orient='records')
+            self.log(f"✓ Persisted segment stats to {stats_path}")
 
 
 def main():
-    """Feature engineering pipeline"""
-
-    print("\n" + "🔧 " * 20)
-    print("  AUSTIN SENTINEL - FEATURE ENGINEERING")
-    print("🔧 " * 20 + "\n")
-
-    engineer = FeatureEngineer(verbose=True)
-
-    # Ensure output directory exists
-    os.makedirs(FEATURES_DATA_DIR, exist_ok=True)
-
-    # Process TRAINING data (compute grid stats)
-    print("\n" + "="*60)
-    print("Processing TRAINING data")
-    print("="*60)
-
-    train_data = engineer.load_data(PROCESSED_DATA_DIR / "train_clean.json")
-    train_features = engineer.engineer_features(train_data, compute_grid_stats=True)
-    engineer.save_features(
-        train_features,
-        FEATURES_DATA_DIR / "train_features.json"
-    )
-    engineer.save_grid_stats(FEATURES_DATA_DIR / "grid_stats.json")
-
-    # Process VALIDATION data (use pre-computed grid stats)
-    print("\n" + "="*60)
-    print("Processing VALIDATION data")
-    print("="*60)
-
-    val_data = engineer.load_data(PROCESSED_DATA_DIR / "val_clean.json")
-    val_features = engineer.engineer_features(val_data, compute_grid_stats=False)
-    engineer.save_features(
-        val_features,
-        FEATURES_DATA_DIR / "val_features.json"
-    )
-
-    # Process TEST data (use pre-computed grid stats)
-    print("\n" + "="*60)
-    print("Processing TEST data")
-    print("="*60)
-
-    test_data = engineer.load_data(PROCESSED_DATA_DIR / "test_clean.json")
-    test_features = engineer.engineer_features(test_data, compute_grid_stats=False)
-    engineer.save_features(
-        test_features,
-        FEATURES_DATA_DIR / "test_features.json"
-    )
-
-    print("\n" + "="*60)
-    print("✓ FEATURE ENGINEERING COMPLETE")
-    print("="*60)
-    print(f"\nFeature files saved to: {FEATURES_DATA_DIR}")
-    print(f"  - train_features.json ({len(train_features):,} records)")
-    print(f"  - val_features.json   ({len(val_features):,} records)")
-    print(f"  - test_features.json  ({len(test_features):,} records)")
-    print(f"  - grid_stats.json     ({len(engineer.grid_stats):,} grid cells)")
-
-    # Show sample features
-    print("\n" + "="*60)
-    print("SAMPLE FEATURE SET")
-    print("="*60)
-
-    sample = train_features[0]
-    print(f"\nFeature count: {len(sample)} features")
-    print("\nTemporal features:")
-    for key in ['hour', 'day_of_week', 'is_weekend', 'is_rush_hour', 'season']:
-        if key in sample:
-            print(f"  {key}: {sample[key]}")
-
-    print("\nSpatial features:")
-    for key in ['latitude', 'longitude', 'grid_cell', 'distance_from_center', 'quadrant']:
-        if key in sample:
-            print(f"  {key}: {sample[key]}")
-
-    print("\nGrid-based features:")
-    for key in ['grid_incident_count', 'grid_risk_score', 'grid_avg_severity']:
-        if key in sample:
-            print(f"  {key}: {sample[key]}")
-
-    print()
+    engineer = TemporalFeatureEngineer()
+    for split in ("train", "val", "test"):
+        engineer.build_split(split, compute_targets=True)
 
 
 if __name__ == "__main__":
